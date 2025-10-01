@@ -3,3 +3,5 @@
 # videos/
 # *.txt
 # !171.txt
+
+*.log
