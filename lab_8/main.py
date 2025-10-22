@@ -21,7 +21,25 @@ class Payload(BaseModel):
 
 @app.get("/")
 def home():
-  return {"message": "Bienvenido a mi API con FastAPI"}
+  description = {
+    "model": "Clasificador de potabilidad de agua con XGBoost.",
+    "problem": "Determinar si una muestra de agua es potable (1) o no potable (0).",
+    "input": {
+      "ph": "Nivel de acidez del agua",
+      "Hardness": "Capacidad de precipitar jabón (mg/L)",
+      "Solids": "Cantidad de sólidos disueltos (ppm)",
+      "Chloramines": "Cantidad de cloraminas (ppm)",
+      "Sulfate": "Cantidad de sulfatos disueltos (ppm)",
+      "Conductivity": "Conductividad eléctrica del agua (µS/cm)",
+      "Organic_carbon": "Cantidad de carbono orgánico (ppm)",
+      "Trihalomethanes": "Cantidad de trihalometanos (µg/L)",
+      "Turbidity": "Turbidez (NTU)"
+    },
+    "output": {
+      "potabilidad": "1 si es agua potable, 0 si es no potable"
+    }
+  }
+  return description
 
 @app.post("/potabilidad/")
 def predict(payload: Payload):

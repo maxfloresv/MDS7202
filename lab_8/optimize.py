@@ -6,6 +6,8 @@ import pickle
 import sklearn
 import plotly
 import plotly.express as px
+import fastapi
+import pydantic
 
 from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
@@ -25,8 +27,6 @@ y = df["Potability"]
 X_train, X_test, y_train, y_test = train_test_split(
   X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
 )
-
-print(X_train.columns)
 
 def get_best_model(experiment_id) -> Pipeline:
   """ 
@@ -83,7 +83,6 @@ def optimize_model():
       'min_child_weight': trial.suggest_int("min_child_weight", 1, 5),
       'reg_alpha': trial.suggest_float("reg_alpha", 0.0, 1.0),
       'reg_lambda': trial.suggest_float("reg_lambda", 0.0, 1.0),
-      'min_frequency': trial.suggest_float("min_frequency", 0.0, 1.0)
     }
 
     run_name = f"XGBoost_trial_{trial.number}"
@@ -98,7 +97,6 @@ def optimize_model():
         ('preprocessor', ct),
         ('model', XGBClassifier(
           **params, 
-          use_label_encoder=False, 
           eval_metric='logloss'
         ))
       ])
@@ -160,18 +158,20 @@ def optimize_model():
     mlflow.log_params(best_model.get_params())
     mlflow.sklearn.log_model(best_model, name="model")
     mlflow.log_artifact(plot_path)
-    mlflow.log_dict(
-      {
-        "pandas": pd.__version__,
-        "mlflow": mlflow.__version__,
-        "optuna": optuna.__version__,
-        "scikit-learn": sklearn.__version__,
-        "plotly": plotly.__version__,
-        "xgboost": xgb.__version__,
-        "python": os.sys.version.split()[0]
-      },
-      "library_versions.json"
-    )
+    library_versions = {
+      "pandas": pd.__version__,
+      "mlflow": mlflow.__version__,
+      "optuna": optuna.__version__,
+      "scikit-learn": sklearn.__version__,
+      "plotly": plotly.__version__,
+      "xgboost": xgb.__version__,
+      "fastapi": fastapi.__version__,
+      "pydantic": pydantic.__version__
+    }
+    mlflow.log_dict(library_versions, "library_versions.json")
+    with open("requirements.txt", "w") as f:
+      for lib, version in library_versions.items():
+        f.write(f"{lib}=={version}\n")
 
   return best_model
 
