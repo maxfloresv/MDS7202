@@ -63,6 +63,66 @@ def split_data(**kwargs) -> None:
   test_data.to_csv(test_path, index=False)
 
 def train_model(**kwargs)-> None:
-    X_train = train_data.drop(columns=[TARGET_COLUMN])
-    y_train = train_data[TARGET_COLUMN]
-    
+  ti=kwargs['ti']
+  model=kwargs['model']
+  base_dir = ti.xcom_pull(key='base_dir')
+  train_data=pd.read_csv(f'{base_dir}/splits/train_data.csv')
+  test_data=pd.read_csv(f'{base_dir}/splits/test_data.csv')
+  X_train = train_data.drop(columns=[TARGET_COLUMN])
+  y_train = train_data[TARGET_COLUMN]
+  X_test = test_data.drop(columns=[TARGET_COLUMN])
+  y_test = test_data[TARGET_COLUMN]
+
+  categorical = [
+    'Gender', 
+    'EducationLevel', 
+    'PreviousCompanies', 
+    'RecruitmentStrategy'
+  ]
+  numerical = [
+    col for col in X_train.columns if col not in categorical
+  ]
+
+  num_pipe = Pipeline(steps=[('scaler', MinMaxScaler())])
+  ct = ColumnTransformer(
+    transformers=[
+      ('num', num_pipe, numerical),
+      ('cat', 'passthrough', categorical)
+    ]
+  )
+  pipeline = Pipeline(steps=[
+    ('preprocessor', ct),
+    ('classifier', model(random_state=RANDOM_STATE))
+  ])
+  pipeline.fit(X_train, y_train)
+  model_path = f"{base_dir}/models/{model.__class__.__name__}.joblib"
+  joblib.dump(pipeline, model_path)
+  print(f"Model saved to: {model_path}")
+
+def evaluate_models():
+  ti = kwargs['ti']
+  base_dir = ti.xcom_pull(key='base_dir')
+  test_data = pd.read_csv(f'{base_dir}/splits/test_data.csv')
+
+  X_test = test_data.drop(columns=[TARGET_COLUMN])
+  y_test = test_data[TARGET_COLUMN]
+
+  model_files = [
+    f for f in os.listdir(f'{base_dir}/models') if f.endswith('.joblib')
+  ]
+  results = {}
+  for model_file in model_files:
+    model_path = f"{base_dir}/models/{model_file}"
+    pipeline = joblib.load(model_path)
+    y_pred = pipeline.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    f1 = f1_score(y_test, y_pred)
+    results[model_file] = {
+      'accuracy': accuracy,
+      'f1_score': f1
+    }
+  best_model = max(results, key=lambda x: x[1]['accuracy'])
+  best_model_name= best_model[0].replace('.joblib', '')
+  best_accuracy= results[best_model]['accuracy']
+  print(f"Best model: {best_model_name}, Accuracy: {best_accuracy}")
+
