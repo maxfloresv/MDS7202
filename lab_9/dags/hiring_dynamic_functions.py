@@ -1,4 +1,5 @@
 import os
+import inspect
 import pandas as pd
 import gradio as gr
 import joblib
@@ -34,20 +35,23 @@ def loads_ands_merge(**kwargs) -> None:
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
-  all_files = [f for f in os.listdir(f'{base_dir}/raw') if f.endswith('.csv')]
-  df_list = [pd.read_csv(f'{base_dir}/raw/{file}') for file in all_files]
+  files = ['data_1.csv', 'data_2.csv']
+  if any(not os.path.exists(f'{base_dir}/raw/{file}') for file in files):  
+    raise FileNotFoundError("One or more raw data files are missing.")
+  df_list = [pd.read_csv(f'{base_dir}/raw/{file}') for file in files]
   merged_df = pd.concat(df_list, ignore_index=True)
   merged_df.to_csv(f'{base_dir}/preprocessed/merged_data.csv', index=False)
+
 def split_data(**kwargs) -> None:
   """
   Split the raw data into training and testing sets, and saves them as CSV files.
   """
-  ti= kwatgs['ti']
+  ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
-  df=pd.read_csv(f'{base_dir}/preprocessed/merged_data.csv')
+  df = pd.read_csv(f'{base_dir}/preprocessed/merged_data.csv')
 
   X = df.drop(columns=[TARGET_COLUMN])
-  y=df[TARGET_COLUMN]
+  y = df[TARGET_COLUMN]
   X_train, X_test, y_train, y_test = train_test_split(
     X, 
     y, 
@@ -55,23 +59,27 @@ def split_data(**kwargs) -> None:
     stratify=y, 
     random_state=RANDOM_STATE
   )
-  train_data=pd.concat([X_train, y_train], axis=1)
-  test_data=pd.concat([X_test, y_test], axis=1)
+
+  train_data = pd.concat([X_train, y_train], axis=1)
+  test_data = pd.concat([X_test, y_test], axis=1)
+
   train_path = f"{base_dir}/splits/train_data.csv"
   test_path = f"{base_dir}/splits/test_data.csv"
+
   train_data.to_csv(train_path, index=False)
   test_data.to_csv(test_path, index=False)
 
-def train_model(**kwargs)-> None:
-  ti=kwargs['ti']
-  model=kwargs['model']
+def train_model(model, **kwargs) -> None:
+  """
+  Train a classification model with preprocessing and save the trained model.
+  """
+  ti = kwargs['ti']
+  model_params = inspect.signature(model).parameters
   base_dir = ti.xcom_pull(key='base_dir')
-  train_data=pd.read_csv(f'{base_dir}/splits/train_data.csv')
-  test_data=pd.read_csv(f'{base_dir}/splits/test_data.csv')
+
+  train_data = pd.read_csv(f'{base_dir}/splits/train_data.csv')
   X_train = train_data.drop(columns=[TARGET_COLUMN])
   y_train = train_data[TARGET_COLUMN]
-  X_test = test_data.drop(columns=[TARGET_COLUMN])
-  y_test = test_data[TARGET_COLUMN]
 
   categorical = [
     'Gender', 
@@ -84,22 +92,28 @@ def train_model(**kwargs)-> None:
   ]
 
   num_pipe = Pipeline(steps=[('scaler', MinMaxScaler())])
+
   ct = ColumnTransformer(
     transformers=[
       ('num', num_pipe, numerical),
-      ('cat', 'passthrough', categorical)
-    ]
+    ], remainder='passthrough'
   )
-  pipeline = Pipeline(steps=[
-    ('preprocessor', ct),
-    ('classifier', model(random_state=RANDOM_STATE))
-  ])
-  pipeline.fit(X_train, y_train)
-  model_path = f"{base_dir}/models/{model.__class__.__name__}.joblib"
-  joblib.dump(pipeline, model_path)
-  print(f"Model saved to: {model_path}")
 
-def evaluate_models():
+  pipe = Pipeline(steps=[
+    ('preprocessor', ct),
+    ('classifier', 
+      model(random_state=RANDOM_STATE) if 'random_state' in model_params else model()
+    )
+  ])
+
+  pipe.fit(X_train, y_train)
+  model_path = f"{base_dir}/models/{model.__class__.__name__}.joblib"
+  joblib.dump(pipe, model_path)
+
+def evaluate_models(**kwargs) -> None:
+  """
+  Evaluate all trained models and print the best one based on accuracy.
+  """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
   test_data = pd.read_csv(f'{base_dir}/splits/test_data.csv')
@@ -110,19 +124,21 @@ def evaluate_models():
   model_files = [
     f for f in os.listdir(f'{base_dir}/models') if f.endswith('.joblib')
   ]
+
   results = {}
   for model_file in model_files:
     model_path = f"{base_dir}/models/{model_file}"
-    pipeline = joblib.load(model_path)
-    y_pred = pipeline.predict(X_test)
-    accuracy = accuracy_score(y_test, y_pred)
-    f1 = f1_score(y_test, y_pred)
-    results[model_file] = {
-      'accuracy': accuracy,
-      'f1_score': f1
-    }
-  best_model = max(results, key=lambda x: x[1]['accuracy'])
-  best_model_name= best_model[0].replace('.joblib', '')
-  best_accuracy= results[best_model]['accuracy']
-  print(f"Best model: {best_model_name}, Accuracy: {best_accuracy}")
+    pipe = joblib.load(model_path)
 
+    y_pred = pipe.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred)
+    results[model_file] = accuracy
+
+  best_model = max(results, key=results.get)
+  best_accuracy = results[best_model]
+  print(f"Best model: {best_model.replace('.joblib', '')}. Accuracy: {best_accuracy:.3f}.")
+
+  joblib.dump(
+    joblib.load(f"{base_dir}/models/{best_model}"), 
+    f"{base_dir}/models/best_model.joblib"
+  )
