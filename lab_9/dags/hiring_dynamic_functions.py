@@ -1,18 +1,27 @@
 import os
 import inspect
 import pandas as pd
-import gradio as gr
 import joblib
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import MinMaxScaler
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, f1_score
+from sklearn.metrics import accuracy_score
 
 RANDOM_STATE = 42
 TARGET_COLUMN = 'HiringDecision'
 BASE_PATH = os.environ.get('AIRFLOW_HOME', '/opt/airflow')
+
+def data_branching(ds, **kwargs):
+  """
+  Auxiliary function to implement branching logic based on the execution date.
+  """
+  threshold_date = '2024-11-01'
+  ti = kwargs['ti']
+  if ds < threshold_date:
+    return ['download_dataset_1']
+  else:
+    return ['download_dataset_1', 'download_dataset_2']
 
 def create_folders(**kwargs) -> None:
   """
@@ -29,16 +38,19 @@ def create_folders(**kwargs) -> None:
   os.makedirs(f"{base_dir}/models", exist_ok=True)
   ti.xcom_push(key='base_dir', value=base_dir)
 
-def loads_ands_merge(**kwargs) -> None:
+def load_and_merge(**kwargs) -> None:
   """
   Load and merge multiple raw data files into a single DataFrame.
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
   files = ['data_1.csv', 'data_2.csv']
-  if any(not os.path.exists(f'{base_dir}/raw/{file}') for file in files):  
-    raise FileNotFoundError("One or more raw data files are missing.")
-  df_list = [pd.read_csv(f'{base_dir}/raw/{file}') for file in files]
+  df_list = []
+  for file in files:
+    if os.path.exists(f'{base_dir}/raw/{file}'):
+      df_list.append(pd.read_csv(f'{base_dir}/raw/{file}'))
+  if len(df_list) == 0:
+    raise FileNotFoundError("No data files found to merge.")
   merged_df = pd.concat(df_list, ignore_index=True)
   merged_df.to_csv(f'{base_dir}/preprocessed/merged_data.csv', index=False)
 
@@ -107,7 +119,7 @@ def train_model(model, **kwargs) -> None:
   ])
 
   pipe.fit(X_train, y_train)
-  model_path = f"{base_dir}/models/{model.__class__.__name__}.joblib"
+  model_path = f"{base_dir}/models/{model.__name__}.joblib"
   joblib.dump(pipe, model_path)
 
 def evaluate_models(**kwargs) -> None:
@@ -132,11 +144,12 @@ def evaluate_models(**kwargs) -> None:
 
     y_pred = pipe.predict(X_test)
     accuracy = accuracy_score(y_test, y_pred)
+    print(f"Model: {model_file.replace('.joblib', '')}, Accuracy: {accuracy:.3f}.")
     results[model_file] = accuracy
 
   best_model = max(results, key=results.get)
   best_accuracy = results[best_model]
-  print(f"Best model: {best_model.replace('.joblib', '')}. Accuracy: {best_accuracy:.3f}.")
+  print(f"Best model: {best_model.replace('.joblib', '')}. Best accuracy: {best_accuracy:.3f}.")
 
   joblib.dump(
     joblib.load(f"{base_dir}/models/{best_model}"), 
