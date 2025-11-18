@@ -1,166 +1,319 @@
 import pandas as pd
+import numpy as np
 import os
 import gc
 
+from feature_engine.selection import DropConstantFeatures
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer
+
+""" 
+These are the environment variables that can be set to configure the script.
+If using Docker, they are set in the docker-compose.yml file.
+"""
 BASE_PATH = os.environ.get('AIRFLOW_HOME', '/opt/airflow')
+DEBUG_MODE = os.environ.get('DEBUG_MODE', 'True').lower() == 'true'
 
 def create_folders(**kwargs) -> None:
+    """
+    Create necessary folders for the current execution date.
+    """
     ts = kwargs['ts']
     ti = kwargs['ti']
     safe_ts = ts.replace(":", "_").replace("+", "_").replace("T", "_")
     base_dir = f"{BASE_PATH}/{safe_ts}"
-    os.makedirs(f"{base_dir}/raw", exist_ok=True)
-    os.makedirs(f"{base_dir}/preprocessed", exist_ok=True)
-    os.makedirs(f"{base_dir}/splits", exist_ok=True)
-    os.makedirs(f"{base_dir}/models", exist_ok=True)
+    for dir in ['raw', 'preprocessed', 'splits', 'models']:
+        os.makedirs(f"{base_dir}/{dir}", exist_ok=True)
     ti.xcom_push(key='base_dir', value=base_dir)
 
-def extract_and_load(**kwargs) -> None:
-    ti = kwargs['ti']
-    base_dir = ti.xcom_pull(key='base_dir')
-    transactions_path = os.path.join(BASE_PATH, 'raw', 'transactions.parquet')
-    products_path = os.path.join(BASE_PATH, 'raw', 'products.parquet')
-    clients_path = os.path.join(BASE_PATH, 'raw', 'clients.parquet')    
-    transactions_df = pd.read_parquet(transactions_path)
-    products_df = pd.read_parquet(products_path)
-    clients_df = pd.read_parquet(clients_path)
-    raw_dir = f"{base_dir}/raw"
-    if os.path.exists(raw_dir):
-        new_files = [
-            f for f in os.listdir(raw_dir)
-            if f.endswith('.parquet')
-        ]
-        for file in new_files:
-            file_path = os.path.join(raw_dir, file)
-            if 'transactions' in file:
-                new_df = pd.read_parquet(file_path)
-                transactions_df = pd.concat([transactions_df, new_df], ignore_index=True)
-            elif 'products' in file:
-                new_df = pd.read_parquet(file_path)
-                products_df = pd.concat([products_df, new_df], ignore_index=True)
-            elif 'clients' in file:
-                new_df = pd.read_parquet(file_path)
-                clients_df = pd.concat([clients_df, new_df], ignore_index=True)
-    clients_df.drop(
-        columns=['region_id', 'zone_id', 'num_visit_per_week'],
-        inplace=True,
-        errors='ignore'
-    )  
-    ti.xcom_push(key='transactions_df', value=transactions_df)
-    ti.xcom_push(key='products_df', value=products_df)
-    ti.xcom_push(key='clients_df', value=clients_df)
+def remove_transaction_invalid_entries(trx: pd.DataFrame) -> pd.DataFrame:
+    """
+    Remove invalid entries from the transactions dataframe.
 
-def negative_items(**kwargs) -> None:
-    ti = kwargs['ti']
-    transactions_df = ti.xcom_pull(key='transactions_df')
-    dupes = transactions_df.groupby(['product_id', 'order_id']).size() > 1
-    dupes_keys = set(dupes[dupes].index)
-    neg_keys = set(
-        transactions_df[transactions_df['items'] < 0]
-            [['product_id', 'order_id']]
-            .apply(tuple, axis=1)
+    Parameters
+    ----------
+    trx : pd.DataFrame
+        The transactions dataframe to remove invalid entries from.
+
+    Returns
+    ----------
+    pd.DataFrame
+        The transactions dataframe with the invalid entries removed.
+    """
+    key_cols = ['product_id', 'order_id']
+    duplicates = (
+        trx.groupby(key_cols)
+            .size()
+            .reset_index(name='count')
     )
-    unique_neg = neg_keys - dupes_keys
-    transactions_df = transactions_df[
-        ~transactions_df[['product_id', 'order_id']]
-            .apply(tuple, axis=1)
-            .isin(unique_neg)
-    ].copy()
-    mode_max = transactions_df.groupby(['product_id', 'order_id'])['items'].transform(
+    duplicates = duplicates[duplicates['count'] > 1]
+    negative_items = trx.query('items < 0')[key_cols]
+
+    negative_unique = set(negative_items.apply(tuple, axis=1))
+    duplicates_unique = set(duplicates[key_cols].apply(tuple, axis=1))
+
+    # Remove negative items that aren't duplicated.
+    negative_not_duped_keys = negative_unique - duplicates_unique
+    mask = trx[key_cols].apply(tuple, axis=1).isin(negative_not_duped_keys)
+    trx = trx[~mask]
+
+    # Only consider the most frequent item for each product and order combination.
+    max_mode = trx.groupby(key_cols)['items'].transform(
         lambda x: x.mode().max()
     )
-    transactions_df = transactions_df[
-        transactions_df['items'] == mode_max
-    ].drop_duplicates().copy()
-    
-    ti.xcom_push(key='transactions_df', value=transactions_df)
-    gc.collect()
+    # Prevent floating point precision issues.
+    proximity_mask = np.isclose(trx['items'], max_mode)
+    trx = trx[proximity_mask]
 
-def filter_active_entities(**kwargs) -> None:
-    ti = kwargs['ti']
-    transactions_df = ti.xcom_pull(key='transactions_df')
-    products_df = ti.xcom_pull(key='products_df')
-    clients_df = ti.xcom_pull(key='clients_df')
-    active_clients = transactions_df['client_id'].value_counts()
-    active_clients = active_clients[active_clients >= 1].index
-    clients_df = clients_df[
-        clients_df['client_id'].isin(active_clients)
-    ].copy()
-    active_products = transactions_df['product_id'].unique()
-    products_df = products_df[
-        products_df['product_id'].isin(active_products)
-    ].copy()
-    transactions_df = transactions_df[
-        transactions_df['client_id'].isin(active_clients) &
-        transactions_df['product_id'].isin(active_products)
-    ].copy()
-    ti.xcom_push(key='transactions_df', value=transactions_df)
-    ti.xcom_push(key='products_df', value=products_df)
-    ti.xcom_push(key='clients_df', value=clients_df)
-    gc.collect()
+    assert trx[trx['items'] < 0].shape[0] == 0, (
+        "Negative items found in the transactions dataframe."
+    )
 
-def create_weekly_base(**kwargs) -> None:
+    assert (
+        trx.groupby(key_cols)
+            .size()
+            .reset_index(name='count')
+            .query('count > 1')
+    ).empty, (
+        "Duplicate items found in the transactions dataframe."
+    )
+
+    return trx
+
+def remove_unheard_clients(
+    clients: pd.DataFrame, 
+    trx: pd.DataFrame,
+    min_transactions: int = 1
+) -> pd.DataFrame:
+    """
+    Remove clients that have not made any transactions.
+
+    Parameters
+    ----------
+    clients : pd.DataFrame
+        The clients dataframe to remove unheard clients from.
+    trx : pd.DataFrame
+        The transactions dataframe to get the client ids from.
+    min_transactions : int, default=1
+        Minimum number of transactions a client must have to be kept.
+
+    Returns
+    ----------
+    pd.DataFrame
+        The dataframe with the clients that have made at least min_transactions transactions.
+    """
+    counts = trx['client_id'].value_counts()
+    filtered_clients = counts[counts >= min_transactions].index
+    clients = clients[clients['client_id'].isin(filtered_clients)]
+
+    assert clients.shape[0] == len(filtered_clients), (
+        "Unheard clients filter was not applied correctly."
+    )
+
+    return clients
+
+def remove_unbought_products(
+    products: pd.DataFrame, 
+    trx: pd.DataFrame,
+    min_bought: int = 1
+) -> pd.DataFrame:
+    """
+    Remove products that have not been bought.
+
+    Parameters
+    ----------
+    products : pd.DataFrame
+        The products dataframe to remove unbought products from.
+    trx : pd.DataFrame
+        The transactions dataframe to get the product ids from.
+    min_bought : int, default=1
+        Minimum number of times a product must be bought to be kept.
+
+    Returns
+    ----------
+    pd.DataFrame
+        The dataframe with the products that have been purchased at least min_bought times.
+    """
+    counts = trx['product_id'].value_counts()
+    filtered_products = counts[counts >= min_bought].index
+    products = products[products['product_id'].isin(filtered_products)]
+
+    assert products.shape[0] == len(filtered_products), (
+        "Unbought products filter was not applied correctly."
+    )
+
+    return products
+
+def preprocess(**kwargs) -> None:
+    """
+    Preprocess the data, applying reproducible transformations.
+    """
     ti = kwargs['ti']
-    transactions_df = ti.xcom_pull(key='transactions_df')
-    products_df = ti.xcom_pull(key='products_df')
-    clients_df = ti.xcom_pull(key='clients_df')
-    transactions_df['week'] = transactions_df['order_date'].dt.isocalendar().week
-    customer_ids = clients_df['client_id'].unique()
-    product_ids = products_df['product_id'].unique()
-    weeks = transactions_df['week'].unique()
-    
+    base_dir = ti.xcom_pull(key='base_dir')
+
+    raw_dir = f"{base_dir}/raw"
+    trx_path = os.path.join(raw_dir, 'transacciones.parquet')
+    products_path = os.path.join(raw_dir, 'productos.parquet')
+    customers_path = os.path.join(raw_dir, 'clientes.parquet')
+
+    # Although this task is only executed once downloading status is successful, 
+    # there may be issues previously. This is why we catch the FileNotFoundError 
+    # and raise a custom error.
+    try: 
+        trx = pd.read_parquet(trx_path, engine='pyarrow')
+        products = pd.read_parquet(products_path, engine='pyarrow')
+        customers = pd.read_parquet(customers_path, engine='pyarrow')
+    except FileNotFoundError as err:
+        raise FileNotFoundError(f"Error reading data files: {err}")
+
+    preprocessed_dir = f"{base_dir}/preprocessed"
+
+    """
+    Transactions preprocessing must be performed first.
+    """
+    pipe_trx = Pipeline(steps=[
+        ('drop_constant_features', DropConstantFeatures(tol=0.85)),
+        ('remove_transaction_invalid_entries', FunctionTransformer(
+            func=remove_transaction_invalid_entries
+        ))
+    ])
+    trx = pipe_trx.fit_transform(trx)
+    trx_path_out = os.path.join(preprocessed_dir, 'transacciones.parquet')
+    pd.to_parquet(trx, trx_path_out, engine='pyarrow')
+    ti.xcom_push(key='preprocessed_trx_path', value=trx_path_out)
+
+    pipe_client = Pipeline(steps=[
+        ('drop_constant_features', DropConstantFeatures(tol=0.85)),
+        ('remove_unheard_clients', FunctionTransformer(
+            func=remove_unheard_clients,
+            kw_args={'trx': trx}
+        ))
+    ])
+    customers = pipe_client.fit_transform(customers)
+    customers_path_out = os.path.join(preprocessed_dir, 'clientes.parquet')
+    pd.to_parquet(customers, customers_path_out, engine='pyarrow')
+    ti.xcom_push(key='preprocessed_customers_path', value=customers_path_out)
+
+    pipe_prod = Pipeline(steps=[
+        ('drop_constant_features', DropConstantFeatures(tol=0.85)),
+        ('remove_unbought_products', FunctionTransformer(
+            func=remove_unbought_products,
+            kw_args={'trx': trx}
+        ))
+    ])
+    products = pipe_prod.fit_transform(products)
+    products_path_out = os.path.join(preprocessed_dir, 'productos.parquet')
+    pd.to_parquet(products, products_path_out, engine='pyarrow')
+    ti.xcom_push(key='preprocessed_products_path', value=products_path_out)
+
+def generate_base_dataframe(**kwargs) -> None:
+    """
+    Generate the base dataframe. This is executed when all the dataframes are loaded and cleaned.
+    """
+    ti = kwargs['ti']
+    base_dir = ti.xcom_pull(key='base_dir')
+
+    trx_path = ti.xcom_pull(key='preprocessed_trx_path')
+    products_path = ti.xcom_pull(key='preprocessed_products_path')
+    customers_path = ti.xcom_pull(key='preprocessed_customers_path')
+
+    try:
+        trx = pd.read_parquet(trx_path, engine='pyarrow')
+        customers = pd.read_parquet(customers_path, engine='pyarrow')
+        products = pd.read_parquet(products_path, engine='pyarrow')
+    except FileNotFoundError as err:
+        raise FileNotFoundError(f"Error reading preprocessed data files: {err}")
+
+    trx['week'] = trx['purchase_date'].dt.isocalendar().week
+
+    customer_ids = customers['customer_id'].unique()
+    product_ids = products['product_id'].unique()
+    weeks = trx['week'].unique()
+
     base = pd.MultiIndex.from_product(
         [customer_ids, product_ids, weeks],
-        names=['client_id', 'product_id', 'week']
+        names=['customer_id', 'product_id', 'week']
     ).to_frame(index=False)
+    
+    del customer_ids, product_ids, weeks
+    gc.collect()
+
     weekly_trx = (
-        transactions_df.groupby(['client_id', 'product_id', 'week'])
+        trx.groupby(['customer_id', 'product_id', 'week'])
             .agg({'items': 'sum'})
             .reset_index()
     )
+
     df = base.merge(
         weekly_trx,
-        on=['client_id', 'product_id', 'week'],
+        on=['customer_id', 'product_id', 'week'],
         how='left'
     )
+
     del base, weekly_trx
     gc.collect()
-    ti.xcom_push(key='merged_df', value=df)
-    ti.xcom_push(key='transactions_df', value=transactions_df)
 
-def create_labels(**kwargs) -> None:
-    ti = kwargs['ti']
-    df = ti.xcom_pull(key='merged_df')
     df['items'] = df['items'].fillna(0)
     df['label'] = (df['items'] > 0).astype(int)
     df.drop(columns=['items'], inplace=True)
-    ti.xcom_push(key='merged_df', value=df)
 
-def merge_features(**kwargs) -> None:
-    ti = kwargs['ti']
-    df = ti.xcom_pull(key='merged_df')
-    products_df = ti.xcom_pull(key='products_df')
-    clients_df = ti.xcom_pull(key='clients_df')
-    df = df.merge(clients_df, on='client_id', how='left')
-    df = df.merge(products_df, on='product_id', how='left')
-    df.drop(columns=['category'], inplace=True, errors='ignore')
-    ti.xcom_push(key='final_df', value=df)
-
-def save_preprocessed_data(**kwargs) -> None:
-    ti = kwargs['ti']
-    base_dir = ti.xcom_pull(key='base_dir')
-    df = ti.xcom_pull(key='final_df')
-    transactions_df = ti.xcom_pull(key='transactions_df')
-    df.to_parquet(
-        f"{base_dir}/preprocessed/processed_data.parquet", 
-        engine='pyarrow', 
-        index=False
-    )
-    transactions_df.to_parquet(
-        f"{base_dir}/preprocessed/processed_transactions.parquet", 
-        engine='pyarrow', 
-        index=False
-    )
-    
-    del df, transactions_df
+    df = df.merge(customers, on='customer_id', how='left')
+    del customers
     gc.collect()
+
+    df = df.merge(products, on='product_id', how='left')
+    del products
+    gc.collect()
+
+    preprocessed_dir = f"{base_dir}/preprocessed"
+    base_path_out = os.path.join(preprocessed_dir, 'base.parquet')
+    pd.to_parquet(df, base_path_out, engine='pyarrow')
+    ti.xcom_push(key='preprocessed_base_path', value=base_path_out)
+
+def clean_base_dataframe_types(tol: float = 0.1, **kwargs) -> None:
+    """
+    Clean the base dataframe types, reducing the memory usage.
+
+    Parameters
+    ----------
+    tol : float, default=0.1
+        Tolerance for the percentage of unique values in a column to be considered as categorical.
+    """
+    ti = kwargs['ti']
+    base_path = ti.xcom_pull(key='preprocessed_base_path')
+
+    try:
+        df = pd.read_parquet(base_path, engine='pyarrow')
+    except FileNotFoundError as err:
+        raise FileNotFoundError(f"Error reading base dataframe: {err}")
+
+    # Prevent applying types to columns that don't exist.
+    target_types = {
+        'customer_id': 'int32',
+        'product_id': 'int32',
+        'Y': 'float32',
+        'X': 'float32',
+        'num_deliver_per_week': 'int8',
+        'size': 'float16'
+    }
+    types_to_apply = {
+        col: dtype for col, dtype in target_types.items() if col in df.columns
+    }
+    if types_to_apply:
+        df = df.astype(types_to_apply)
+        gc.collect()
+
+    for col in df.select_dtypes(include=['object']).columns.tolist():
+        unique = df[col].nunique()
+        total_rows = df.shape[0]
+        if unique / total_rows < tol:
+            df[col] = df[col].astype('category')
+
+    gc.collect()
+
+    if DEBUG_MODE:
+        mem = df.memory_usage(deep=True) / 1024**2
+        print(f"Memory usage after cleaning types: {mem.sum():.2f} MB")
+
+    pd.to_parquet(df, base_path, engine='pyarrow')
+    ti.xcom_push(key='final_df_path', value=base_path)
