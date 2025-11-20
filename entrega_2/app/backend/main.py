@@ -16,7 +16,7 @@ app = FastAPI(
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 MODEL_DIR = f"{BASE_DIR}/models"
-MODEL_PATH = f"{MODEL_DIR}/optimized_trained_model.joblib"
+MODEL_PATH = f"{MODEL_DIR}/complete_trained_model.joblib"
 
 model = None
 model_info = {}
