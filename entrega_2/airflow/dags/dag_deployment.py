@@ -16,6 +16,7 @@ from scripts.split_and_apply_transformations import (
 from scripts.train_and_optimize import (
   construct_model,
   save_optimization_study,
+  generate_optuna_plots,
   setup_optimized_model
 )
 from scripts.interpret import (
@@ -78,6 +79,11 @@ with DAG(
       python_callable=save_optimization_study
     )
 
+    generate_optuna_plots = PythonOperator(
+      task_id='generate_optuna_plots',
+      python_callable=generate_optuna_plots
+    )
+
     setup_optimized_model = PythonOperator(
       task_id='setup_optimized_model',
       python_callable=setup_optimized_model
@@ -104,6 +110,7 @@ with DAG(
       >> create_data_transformations
       >> construct_model
       >> save_optimization_study
+      >> generate_optuna_plots
       >> setup_optimized_model
       >> apply_shap_values
       >> generate_shap_summary
