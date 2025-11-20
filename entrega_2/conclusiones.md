@@ -13,6 +13,10 @@
 > Por otro lado, al trabajar con _FastAPI_, la implementación del _backend_ se simplificó bastante en comparación a otros _frameworks_ con los que el equipo había trabajado previamente, dejando una impresión bastante grata para proyectos futuros donde se requiera disponer de una plataforma para permitir la interacción con un modelo en _Python_.
 - ¿Cómo aporta `Airflow` a la robustez y escalabilidad del pipeline?
 
+> **Respuesta**: `Airflow` aporta a la robustez principalmente debido a cómo está construido. Por ejemplo, un aspecto a destacar es que permite comunicar las distintas tareas mediante el argumento `**kwargs`, que puede recibir desde objetos de Python como listas hasta rutas de archivos. El hecho de ocupar correctamente esta _feature_ permite evitar código duplicado.
+>
+> Con respecto a la escalibidad, se podría mencionar que asociar un flujo de tareas a un grafo acíclico dirigido es una buena estrategia, dado que permite generar proyectos que tengan un nodo inicial y final, y además puedan ejecutarse procesos en paralelo. Si se quiere añadir una nueva tarea entremedio, como cada tarea por sí sola tiene una funcionalidad propia (prinicpio de responsabilidad única), bastaría con sólo modificar algún paso del DAG en su _script_.
+
 - ¿Qué se podría mejorar en una versión futura del flujo? ¿Qué partes automatizarían más, qué monitorearían o qué métricas agregarían?
 > **Respuesta:** Una forma interesante de mejorar en una versión futura es la aplicación de _MLFlow_ para el monitoreo de métricas e interpretabilidad, lo cual en el presente trabajo no se realizó, esto permitiría mejorar la trazabilidad de métricas y mejora continua.
 > 
