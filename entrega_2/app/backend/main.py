@@ -22,7 +22,7 @@ model = None
 model_info = {}
 
 MODEL_COLUMNS = ['customer_id','product_id','week','customer_type','Y','X',
-'num_deliver_per_week','brand','sub_category','segment','package','size']
+'num_deliver_per_week','brand','category','sub_category','segment','package','size']
 
 def load_model_from_pickle():
     global model, model_info
@@ -46,7 +46,6 @@ def load_model_from_pickle():
         return False
 load_model_from_pickle()
 
-
 class Payload(BaseModel):
     customer_id: int
     product_id: int
@@ -56,6 +55,7 @@ class Payload(BaseModel):
     X: float
     num_deliver_per_week: int
     brand: str
+    category: str
     sub_category: str
     segment: str
     package: str
@@ -77,6 +77,7 @@ def home():
         'X':'Coordenada X del cliente',
         'num_deliver_per_week':'Número de entregas por semana',
         'brand':'Marca del producto',
+        'category':'Categoría del producto',
         'sub_category':'Subcategoría del producto',
         'segment':'Segmento del producto',
         'package':'Paquete del producto',
@@ -93,7 +94,7 @@ def predict(payload: Payload):
     try:
         data = payload.model_dump()
         X = pd.DataFrame([data], columns=['customer_id','product_id','week','customer_type','Y','X',
-            'num_deliver_per_week','brand','sub_category','segment','package','size'])   
+            'num_deliver_per_week','brand','category','sub_category','segment','package','size'])   
         prediction = float(model.predict(X)[0])
         probability= float(model.predict_proba(X)[0][1])
         return {
