@@ -22,7 +22,15 @@ def create_folders(**kwargs) -> None:
     ti = kwargs['ti']
     safe_ts = ts.replace(":", "_").replace("+", "_").replace("T", "_")
     base_dir = f"{BASE_PATH}/{safe_ts}"
-    for dir in ['raw', 'preprocessed', 'splits', 'models']:
+    for dir in [
+        'raw', 
+        'preprocessed', 
+        'splits', 
+        'models', 
+        'transformers', 
+        'studies',
+        'images'
+    ]:
         os.makedirs(f"{base_dir}/{dir}", exist_ok=True)
     ti.xcom_push(key='base_dir', value=base_dir)
 
@@ -156,8 +164,8 @@ def preprocess(**kwargs) -> None:
 
     raw_dir = f"{base_dir}/raw"
     trx_path = os.path.join(raw_dir, 'transacciones.parquet')
-    products_path = os.path.join(raw_dir, 'productos.parquet')
-    customers_path = os.path.join(raw_dir, 'clientes.parquet')
+    products_path = f'{BASE_PATH}/data/productos.parquet'
+    customers_path = f'{BASE_PATH}/data/clientes.parquet'
 
     # Although this task is only executed once downloading status is successful, 
     # there may be issues previously. This is why we catch the FileNotFoundError 
