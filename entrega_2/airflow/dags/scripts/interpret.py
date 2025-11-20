@@ -36,7 +36,10 @@ def apply_shap_values(**kwargs):
 
   preprocessed_dir = f"{base_dir}/preprocessed"
   X_val_tf_path_out = f"{preprocessed_dir}/X_val_tf.parquet"
-  X_val_tf.to_parquet(X_val_tf_path_out, engine='pyarrow')
+  pd.DataFrame(
+    X_val_tf,
+    columns=optimized_model.named_steps['preprocessor'].get_feature_names_out()
+  ).to_parquet(X_val_tf_path_out, engine='pyarrow')
   ti.xcom_push(key='X_val_tf_path', value=X_val_tf_path_out)
 
 def generate_shap_summary(**kwargs):
@@ -58,6 +61,8 @@ def generate_shap_summary(**kwargs):
 
   X_val_tf_path = ti.xcom_pull(key='X_val_tf_path')
   X_val_tf = pd.read_parquet(X_val_tf_path, engine='pyarrow')
+
+  X_val_tf = X_val_tf.to_numpy()
 
   shap.summary_plot(
     shap_values_dense, 
