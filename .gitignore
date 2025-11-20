@@ -9,3 +9,4 @@ entrega_1/data/processed_data.parquet
 entrega_1/models/shap_results.pkl
 **/mlruns/
 **/__pycache__/
+*.rar
