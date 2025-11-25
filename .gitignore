@@ -10,3 +10,4 @@ entrega_1/models/shap_results.pkl
 **/mlruns/
 **/__pycache__/
 *.rar
+.env
