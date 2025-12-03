@@ -23,11 +23,15 @@ from scripts.interpret import (
   apply_shap_values,
   generate_shap_summary
 )
+from scripts.predict import (
+  generate_test_data,
+  generate_week_predictions
+)
 
 with DAG(
   dag_id='sodai-test-preprocessing',
   schedule_interval='@weekly',
-  start_date=datetime(2025, 11, 18),
+  start_date=datetime(2025, 11, 30),
   tags=['sodai', 'preprocessing']
 ) as dag:
     initial_task = EmptyOperator(task_id='initial_task')
@@ -40,7 +44,7 @@ with DAG(
     dl_transactions = BashOperator(
       task_id='dl_transactions',
       retries=3,
-      bash_command="gdown 1Cwczy6VepuOmEqJ94pcJP-njx-9l61Q6 -O "
+      bash_command="gdown 1dkUPLVXq_patD2RAKsb7ix-kQyRigcUo -O "
         "{{ ti.xcom_pull(key='base_dir') }}/raw/transacciones.parquet"
     )
 
@@ -99,6 +103,17 @@ with DAG(
       python_callable=generate_shap_summary
     )
 
+    generate_test_data = PythonOperator(
+      task_id='generate_test_data',
+      python_callable=generate_test_data,
+      op_kwargs={'W': 3, 'Y': 2025}
+    )
+
+    generate_week_predictions = PythonOperator(
+      task_id='generate_week_predictions',
+      python_callable=generate_week_predictions
+    )
+
     (
       initial_task 
       >> create_folders
@@ -112,6 +127,8 @@ with DAG(
       >> save_optimization_study
       >> generate_optuna_plots
       >> setup_optimized_model
-      >> apply_shap_values
-      >> generate_shap_summary
+      #>> apply_shap_values
+      #>> generate_shap_summary
+      >> generate_test_data
+      >> generate_week_predictions
     )
