@@ -10,18 +10,14 @@ from scripts.preprocessing import (
   clean_base_dataframe_types
 )
 from scripts.split_and_apply_transformations import (
-  split_data,
-  create_data_transformations
+  prepare_full_data,
+  create_preprocessor_template
 )
 from scripts.train_and_optimize import (
-  construct_model,
+  construct_model_template,
   save_optimization_study,
   generate_optuna_plots,
   setup_optimized_model
-)
-from scripts.interpret import (
-  apply_shap_values,
-  generate_shap_summary
 )
 from scripts.predict import (
   generate_test_data,
@@ -31,7 +27,7 @@ from scripts.predict import (
 with DAG(
   dag_id='sodai-test-preprocessing',
   schedule_interval='@weekly',
-  start_date=datetime(2025, 11, 30),
+  start_date=datetime(2025, 12, 3),
   tags=['sodai', 'preprocessing']
 ) as dag:
     initial_task = EmptyOperator(task_id='initial_task')
@@ -63,19 +59,19 @@ with DAG(
       python_callable=clean_base_dataframe_types
     )
 
-    split_data = PythonOperator(
-      task_id='split_data',
-      python_callable=split_data
+    prepare_full_data = PythonOperator(
+      task_id='prepare_full_data',
+      python_callable=prepare_full_data
     )
 
-    create_data_transformations = PythonOperator(
-      task_id='create_data_transformations',
-      python_callable=create_data_transformations
+    create_preprocessor_template = PythonOperator(
+      task_id='create_preprocessor_template',
+      python_callable=create_preprocessor_template
     )
 
-    construct_model = PythonOperator(
-      task_id='construct_model',
-      python_callable=construct_model
+    construct_model_template = PythonOperator(
+      task_id='construct_model_template',
+      python_callable=construct_model_template
     )
 
     save_optimization_study = PythonOperator(
@@ -91,16 +87,6 @@ with DAG(
     setup_optimized_model = PythonOperator(
       task_id='setup_optimized_model',
       python_callable=setup_optimized_model
-    )
-
-    apply_shap_values = PythonOperator(
-      task_id='apply_shap_values',
-      python_callable=apply_shap_values
-    )
-
-    generate_shap_summary = PythonOperator(
-      task_id='generate_shap_summary',
-      python_callable=generate_shap_summary
     )
 
     generate_test_data = PythonOperator(
@@ -121,14 +107,12 @@ with DAG(
       >> preprocess
       >> generate_base_dataframe
       >> clean_base_dataframe_types
-      >> split_data
-      >> create_data_transformations
-      >> construct_model
+      >> prepare_full_data
+      >> create_preprocessor_template
+      >> construct_model_template
       >> save_optimization_study
       >> generate_optuna_plots
       >> setup_optimized_model
-      #>> apply_shap_values
-      #>> generate_shap_summary
       >> generate_test_data
       >> generate_week_predictions
     )
