@@ -7,39 +7,25 @@ from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, MinMaxScaler
 from sklearn.impute import SimpleImputer
 
-def split_data(**kwargs) -> None:
+def prepare_full_data(**kwargs) -> None:
     """
-    Split the data into train (~80 %) and validation (~20 %) sets.
+    Prepares the full dataframe for Cross-Validation.
+    Ensures data is chronologically sorted (important for Rolling Window Cross-Validation).
     """
-    SPLIT_YEAR = 2024
-    SPLIT_WEEK = 44
-
     ti = kwargs['ti']
+    base_dir = ti.xcom_pull(key='base_dir')
+
     df_path = ti.xcom_pull(key='final_df_path')
     df = pd.read_parquet(df_path, engine='pyarrow')
 
-    mask_train = (df['year'] == SPLIT_YEAR) & (df['week'] <= SPLIT_WEEK)
-    train = df[mask_train].copy()
-    val = df[~mask_train].copy()
-
-    base_dir = ti.xcom_pull(key='base_dir')
-    splits_dir = f"{base_dir}/splits"
-
-    train_path_out = f"{splits_dir}/train.parquet"
-    val_path_out = f"{splits_dir}/val.parquet"
-
-    train.to_parquet(train_path_out, engine='pyarrow', index=False)
-    val.to_parquet(val_path_out, engine='pyarrow', index=False)
-
-    ti.xcom_push(key='train_df_path', value=train_path_out)
-    ti.xcom_push(key='val_df_path', value=val_path_out)
-
-def create_data_transformations(**kwargs) -> None:
-    """
-    Creates a ColumnTransformer for Feature Engineering and saves it.
-    Separates X and y, and saves them to the splits directory.
-    """
-    ti = kwargs['ti']
+    # The first priority is to sort the data by year.
+    # Includes customer_id and product_id for reproducibility.
+    df = df.sort_values(by=[
+        'year', 
+        'week',
+        'customer_id',
+        'product_id'
+    ])
 
     numerical = [
         'X', 
@@ -64,6 +50,37 @@ def create_data_transformations(**kwargs) -> None:
 
     ti.xcom_push(key='numerical_features', value=numerical)
     ti.xcom_push(key='categorical_features', value=categorical)
+    
+    drop_cols = ['label', 'week', 'items']
+    X_full = df.drop(columns=drop_cols)
+    y_full = df['label']
+
+    splits_dir = f"{base_dir}/splits"
+    X_full_path_out = f"{splits_dir}/X_full.parquet"
+    y_full_path_out = f"{splits_dir}/y_full.parquet"
+
+    X_full.to_parquet(X_full_path_out, engine='pyarrow', index=False)
+    y_full.to_frame(name='label').to_parquet(
+        y_full_path_out, 
+        engine='pyarrow', 
+        index=False
+    )
+
+    del df, X_full, y_full
+    gc.collect()
+
+    ti.xcom_push(key='X_full_path', value=X_full_path_out)
+    ti.xcom_push(key='y_full_path', value=y_full_path_out)
+
+def create_preprocessor_template(**kwargs) -> None:
+    """
+    Creates the unfitted ColumnTransformer and saves it.
+    """
+    ti = kwargs['ti']
+    base_dir = ti.xcom_pull(key='base_dir')
+
+    numerical = ti.xcom_pull(key='numerical_features')
+    categorical = ti.xcom_pull(key='categorical_features')
 
     numerical_pipe = Pipeline(steps=[
         ('imputer', SimpleImputer(strategy='median')),
@@ -81,51 +98,6 @@ def create_data_transformations(**kwargs) -> None:
             ('categorical', categorical_pipe, categorical)
         ], remainder='passthrough'
     )
-
-    base_dir = ti.xcom_pull(key='base_dir')
-
-    train_path = ti.xcom_pull(key='train_df_path')
-    val_path = ti.xcom_pull(key='val_df_path')
-
-    train = pd.read_parquet(train_path, engine='pyarrow')
-    val = pd.read_parquet(val_path, engine='pyarrow')
-
-    # Removes week as it was used only to holdout.
-    X_train = train.drop(columns=['label', 'week'])
-    y_train = train['label']
-
-    X_val = val.drop(columns=['label', 'week'])
-    y_val = val['label']
-
-    del train, val
-    gc.collect()
-
-    # Moves X and y to the splits directory.
-    X_train_path_out = f"{base_dir}/splits/X_train.parquet"
-    X_val_path_out = f"{base_dir}/splits/X_val.parquet"
-
-    X_train.to_parquet(X_train_path_out, engine='pyarrow', index=False)
-    X_val.to_parquet(X_val_path_out, engine='pyarrow', index=False)
-
-    ti.xcom_push(key='X_train_path', value=X_train_path_out)
-    ti.xcom_push(key='X_val_path', value=X_val_path_out)
-
-    y_train_path_out = f"{base_dir}/splits/y_train.parquet"
-    y_val_path_out = f"{base_dir}/splits/y_val.parquet"
-
-    y_train.to_frame(name='label').to_parquet(
-        y_train_path_out, 
-        engine='pyarrow', 
-        index=False
-    )
-    y_val.to_frame(name='label').to_parquet(
-        y_val_path_out, 
-        engine='pyarrow', 
-        index=False
-    )
-
-    ti.xcom_push(key='y_train_path', value=y_train_path_out)
-    ti.xcom_push(key='y_val_path', value=y_val_path_out)
 
     transformers_dir = f"{base_dir}/transformers"
     feature_engineering_transformer_path_out = (

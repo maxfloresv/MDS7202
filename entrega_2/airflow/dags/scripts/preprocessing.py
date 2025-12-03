@@ -295,7 +295,6 @@ def generate_base_dataframe(**kwargs) -> None:
     )['label'].shift(1)
 
     df.fillna(0, inplace=True)
-    df.drop(columns=['items'], inplace=True)
 
     # Uses sine and cosine to encode the week as a periodical variable.
     df['week_sin'] = np.sin(2 * np.pi * df['week'] / 52)
@@ -343,6 +342,7 @@ def clean_base_dataframe_types(tol: float = 0.1, **kwargs) -> None:
         'week': 'int8',
         'week_sin': 'float32',
         'week_cos': 'float32',
+        'items': 'float32',
         'items_lag_1': 'float32',
         'items_rolling_mean_4w': 'float32',
         'purchased_lag_1': 'int8'
