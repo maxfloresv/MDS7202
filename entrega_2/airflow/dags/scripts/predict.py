@@ -1,6 +1,32 @@
 import pandas as pd
 import numpy as np
 import joblib
+from sklearn.base import clone
+from sklearn.metrics import f1_score
+
+def find_best_threshold_binary(y_true, y_probs):
+  """
+  Finds the threshold that maximizes Binary F1 Score.
+
+  Parameters
+  ----------
+  y_true : array-like
+    The true validation labels.
+  y_probs : array-like
+    The predicted probabilities for the validation set.
+  """
+  best_f1 = 0
+  best_thresh = 0.5
+  
+  for thresh in np.arange(0.3, 0.96, 0.01):
+    y_pred_temp = (y_probs >= thresh).astype(int)
+    score = f1_score(y_true, y_pred_temp, average='binary')
+    
+    if score > best_f1:
+      best_f1 = score
+      best_thresh = thresh
+          
+  return best_thresh, best_f1
 
 def generate_test_data(W: int, Y: int, **kwargs):
   """
@@ -15,41 +41,80 @@ def generate_test_data(W: int, Y: int, **kwargs):
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
-  
-  X_fusion_path = ti.xcom_pull(key='X_fusion_path')
-  X_fusion = pd.read_parquet(X_fusion_path, engine='pyarrow')
 
-  # Recovers the week from the sine and cosine values.
-  angles = np.arctan2(X_fusion['week_sin'], X_fusion['week_cos'])
-  angles[angles < 0] += 2 * np.pi
-  X_fusion['week_recovered'] = (angles / (2 * np.pi)) * 52
-  X_fusion['week_recovered'] = X_fusion['week_recovered'].round().astype(int)
-  X_fusion.loc[X_fusion['week_recovered'] == 0, 'week_recovered'] = 52
-  
-  week_sin = np.sin(2 * np.pi * W / 52)
-  week_cos = np.cos(2 * np.pi * W / 52)
+  df_path = ti.xcom_pull(key='final_df_path')
+  df = pd.read_parquet(df_path, engine='pyarrow')
 
-  dynamic_features = ['week_sin', 'week_cos', 'year', 'week_recovered']
-  static_features = [
-    col for col in X_fusion.columns 
-    if col not in dynamic_features
-  ]
-  
-  # Drop duplicates to get only one row per customer-product combination for the given week and year.
-  # Keeps the last occurrence to be consistent with lags and rolling features.
-  X_test = X_fusion.sort_values(
-      by=['customer_id', 'product_id', 'year', 'week_recovered']
-  )[static_features].drop_duplicates(
+  last_known_year = df['year'].max()
+  last_known_week = df[df['year'] == last_known_year]['week'].max()
+
+  mask = (df['year'] == last_known_year) & (df['week'] == last_known_week)
+  candidates = df[mask][[
+    'customer_id', 
+    'product_id', 
+    'X', 
+    'Y', 
+    'num_deliver_per_week', 
+    'size', 
+    'customer_type', 
+    'category', 
+    'sub_category', 
+    'segment', 
+    'package', 
+    'brand'
+  ]].copy()
+
+  candidates = candidates.drop_duplicates(
     subset=['customer_id', 'product_id'],
     keep='last'
-  ).copy()
-  
+  )
+
+  candidates['week'] = W
+  candidates['year'] = Y
+
+  # Dummy values to concatenate with the existing dataframe.
+  candidates['items'] = np.nan
+  candidates['label'] = np.nan
+
+  df_window = pd.concat([df, candidates], ignore_index=True)
+  # Recuperates the last occurrence to be consistent with lags and rolling features.
+  df_window = df_window.sort_values(
+    by=['customer_id', 'product_id', 'year', 'week']
+  )
+
+  df_window['items_lag_1'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['items'].shift(1)
+
+  df_window['items_rolling_mean_4w'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['items'].transform(
+    lambda x: x.shift(1).rolling(
+      window=4,
+      min_periods=1
+    ).mean()
+  )
+  df_window['purchased_lag_1'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['label'].shift(1)
+
+  features_to_fill = ['items_lag_1', 'items_rolling_mean_4w', 'purchased_lag_1']
+  df_window[features_to_fill] = df_window[features_to_fill].fillna(0)
+
+  X_test = df_window[
+    (df_window['year'] == Y) & (df_window['week'] == W)
+  ].copy()
+
+  week_sin = np.sin(2 * np.pi * W / 52)
+  week_cos = np.cos(2 * np.pi * W / 52)
   X_test['week_sin'] = week_sin
   X_test['week_cos'] = week_cos
-  X_test['year'] = Y
   
-  final_columns = [col for col in X_fusion.columns if col != 'week_recovered']
-  X_test = X_test[final_columns]
+  X_full_path = ti.xcom_pull(key='X_full_path')
+  X_full_schema = pd.read_parquet(X_full_path, engine='pyarrow')[:0]
+  objective_columns = X_full_schema.columns.tolist()
+
+  X_test = X_test[objective_columns]
   print(X_test.head())
 
   splits_dir = f"{base_dir}/splits"
@@ -60,7 +125,7 @@ def generate_test_data(W: int, Y: int, **kwargs):
 
 def generate_week_predictions(**kwargs):
   """
-  Generates the predictions for the week in the pipeline.
+  Generates the predictions for the week using the optimized model.
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
@@ -71,10 +136,41 @@ def generate_week_predictions(**kwargs):
   optimized_model_path = ti.xcom_pull(key='optimized_trained_model_path')
   optimized_model = joblib.load(optimized_model_path)
 
-  y_pred = pd.DataFrame(
-    optimized_model.predict(X_test), 
-    columns=['prediction']
+  X_full_path = ti.xcom_pull(key='X_full_path')
+  X_full = pd.read_parquet(X_full_path, engine='pyarrow')
+  
+  y_full_path = ti.xcom_pull(key='y_full_path')
+  y_full = pd.read_parquet(y_full_path, engine='pyarrow').iloc[:, 0]
+
+  last_row = X_full.iloc[-1]
+
+  target_year = last_row['year']
+  target_sin = last_row['week_sin']
+  target_cos = last_row['week_cos']
+
+  year_mask = (X_full['year'] == target_year)
+  week_mask = (
+    np.isclose(X_full['week_sin'], target_sin, atol=1e-4) 
+    & np.isclose(X_full['week_cos'], target_cos, atol=1e-4)
   )
+  mask = year_mask & week_mask
+
+  # Uses the last period available to validate the model.
+  X_shadow_train = X_full[~mask]
+  y_shadow_train = y_full[~mask]
+  X_shadow_val = X_full[mask]
+  y_shadow_val = y_full[mask]
+
+  shadow_model = clone(optimized_model)
+  shadow_model.fit(X_shadow_train, y_shadow_train)
+
+  probs_val = shadow_model.predict_proba(X_shadow_val)[:, 1]
+  best_thresh, best_f1 = find_best_threshold_binary(y_shadow_val, probs_val)
+  print(f"Best threshold: {best_thresh}, Best F1: {best_f1}")
+
+  probs_test = optimized_model.predict_proba(X_test)[:, 1]
+  y_pred_test = (probs_test >= best_thresh).astype(int)
+  y_pred = pd.DataFrame(y_pred_test, columns=['prediction'])
 
   mask = y_pred['prediction'] == 1
   projection = X_test[mask][['customer_id', 'product_id']]
