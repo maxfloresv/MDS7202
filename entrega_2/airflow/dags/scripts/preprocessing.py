@@ -29,7 +29,8 @@ def create_folders(**kwargs) -> None:
         'models', 
         'transformers', 
         'studies',
-        'images'
+        'images',
+        'predictions'
     ]:
         os.makedirs(f"{base_dir}/{dir}", exist_ok=True)
     ti.xcom_push(key='base_dir', value=base_dir)
@@ -244,38 +245,61 @@ def generate_base_dataframe(**kwargs) -> None:
     except FileNotFoundError as err:
         raise FileNotFoundError(f"Error reading preprocessed data files: {err}")
 
+    trx['year'] = trx['purchase_date'].dt.isocalendar().year
     trx['week'] = trx['purchase_date'].dt.isocalendar().week
 
-    customer_ids = customers['customer_id'].unique()
-    product_ids = products['product_id'].unique()
-    weeks = trx['week'].unique()
+    existing_pairs = trx[['customer_id', 'product_id']].drop_duplicates()
+    unique_periods = trx[['year', 'week']].drop_duplicates()
 
-    base = pd.MultiIndex.from_product(
-        [customer_ids, product_ids, weeks],
-        names=['customer_id', 'product_id', 'week']
-    ).to_frame(index=False)
-    
-    del customer_ids, product_ids, weeks
+    base = existing_pairs.merge(
+        unique_periods, 
+        how='cross'
+    )
+
+    del existing_pairs, unique_periods
     gc.collect()
 
-    weekly_trx = (
-        trx.groupby(['customer_id', 'product_id', 'week'])
+    period_trx = (
+        trx.groupby(['customer_id', 'product_id', 'year', 'week'])
             .agg({'items': 'sum'})
             .reset_index()
     )
 
     df = base.merge(
-        weekly_trx,
-        on=['customer_id', 'product_id', 'week'],
+        period_trx,
+        on=['customer_id', 'product_id', 'year', 'week'],
         how='left'
     )
 
-    del base, weekly_trx
+    del base, period_trx
     gc.collect()
 
     df['items'] = df['items'].fillna(0)
     df['label'] = (df['items'] > 0).astype(int)
+
+    df = df.sort_values(
+        by=['customer_id', 'product_id', 'year', 'week']
+    )
+
+    df['items_lag_1'] = df.groupby(['customer_id', 'product_id'])['items'].shift(1)
+    df['items_rolling_mean_4w'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['items'].transform(
+        lambda x: x.shift(1).rolling(
+            window=4, 
+            min_periods=1
+        ).mean()
+    )
+    df['purchased_lag_1'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['label'].shift(1)
+
+    df.fillna(0, inplace=True)
     df.drop(columns=['items'], inplace=True)
+
+    # Uses sine and cosine to encode the week as a periodical variable.
+    df['week_sin'] = np.sin(2 * np.pi * df['week'] / 52)
+    df['week_cos'] = np.cos(2 * np.pi * df['week'] / 52)
 
     df = df.merge(customers, on='customer_id', how='left')
     del customers
@@ -314,7 +338,14 @@ def clean_base_dataframe_types(tol: float = 0.1, **kwargs) -> None:
         'Y': 'float32',
         'X': 'float32',
         'num_deliver_per_week': 'int8',
-        'size': 'float16'
+        'size': 'float16',
+        'year': 'int16',  
+        'week': 'int8',
+        'week_sin': 'float32',
+        'week_cos': 'float32',
+        'items_lag_1': 'float32',
+        'items_rolling_mean_4w': 'float32',
+        'purchased_lag_1': 'int8'
     }
     types_to_apply = {
         col: dtype for col, dtype in target_types.items() if col in df.columns
