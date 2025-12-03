@@ -1,11 +1,11 @@
-import pandas as pd
-import optuna.visualization as opt_vis
-from optuna.integration.lightgbm import LightGBMPruningCallback
 import os
 import gc
 import optuna
-from optuna.samplers import TPESampler
 import joblib
+import pandas as pd
+import numpy as np
+import optuna.visualization as opt_vis
+from optuna.samplers import TPESampler
 from sklearn.metrics import f1_score
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import (
@@ -15,14 +15,19 @@ from sklearn.preprocessing import (
 )
 from sklearn.impute import SimpleImputer
 from sklearn.compose import ColumnTransformer
-from lightgbm import LGBMClassifier, early_stopping, log_evaluation
+from sklearn.model_selection import TimeSeriesSplit
+from lightgbm import (
+  LGBMClassifier, 
+  early_stopping, 
+  log_evaluation
+)
 
 RANDOM_STATE = 42
 BASE_PATH = os.environ.get('AIRFLOW_HOME', '/opt/airflow')
 
-def construct_model(**kwargs):
+def construct_model_template(**kwargs):
   """
-  Constructs a LightGBM model with preprocessing and saves it.
+  Constructs a LightGBM model template with preprocessing and saves it.
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
@@ -36,14 +41,15 @@ def construct_model(**kwargs):
     ('preprocessor', preprocessor),
     ('classifier', LGBMClassifier(
       objective='binary',
-      random_state=RANDOM_STATE
+      random_state=RANDOM_STATE,
+      n_jobs=-1
     ))
   ])
 
   models_dir = f"{base_dir}/models"
-  model_path_out = f"{models_dir}/lgbm_model.joblib"
+  model_path_out = f"{models_dir}/lgbm_model_template.joblib"
   joblib.dump(lgbm_model, model_path_out)
-  ti.xcom_push(key='model_path', value=model_path_out)
+  ti.xcom_push(key='model_template_path', value=model_path_out)
 
 def save_optimization_study(**kwargs):
   """
@@ -51,11 +57,10 @@ def save_optimization_study(**kwargs):
   """
   def objective_function(
     trial, 
-    X_train, 
-    y_train, 
-    X_val, 
-    y_val, 
-    model,
+    X_full,
+    y_full,
+    model_template,
+    cv_splits=3,
     random_state=RANDOM_STATE
   ) -> float:
     """
@@ -65,23 +70,21 @@ def save_optimization_study(**kwargs):
     ----------
     trial : optuna.trial.Trial
       An Optuna trial object.
-    X_train : pd.DataFrame
-      Training features.
-    y_train : pd.Series
-      Training labels.
-    X_val : pd.DataFrame
-      Validation features.
-    y_val : pd.Series
-      Validation labels.
-    model : Pipeline
-      LightGBM model with preprocessing.
+    X_full : pd.DataFrame
+      Full dataset features.
+    y_full : pd.Series
+      Full dataset labels.
+    model_template : Pipeline
+      LightGBM model template with preprocessing.
+    cv_splits : int, optional
+      Number of cross-validation splits, by default 3.
     random_state : int, optional
       Random state for reproducibility, by default 42.
 
     Returns
     -------
     float
-      The macro F1-score on the validation set.
+      The mean macro F1-score on the cross-validation sets.
     """
     params = {
       "classifier__num_leaves": trial.suggest_int("num_leaves", 20, 200),
@@ -117,88 +120,80 @@ def save_optimization_study(**kwargs):
     else:
       params["preprocessor__numerical__scaler"] = "passthrough"
 
-    # Implements pruning callback to stop unpromising trials early.
-    pruning_callback = LightGBMPruningCallback(
-      trial, 
-      metric='auc', 
-      valid_name='valid_0' 
-    )
-
-    early_stopping_callback = early_stopping(
-      stopping_rounds=100,
-      first_metric_only=True
-    )
-
-    # Logs the evaluation metrics every 100 boosting stages.
-    log_callback = log_evaluation(period=100)
-
-    model.set_params(**params)
-
-    preprocessor = model.named_steps['preprocessor']
-    classifier = model.named_steps['classifier']
-
-    X_train_prepared = preprocessor.fit_transform(X_train, y_train)
-    X_val_prepared = preprocessor.transform(X_val)
+    model_template.set_params(**params)
     
-    classifier.fit(
-      X_train_prepared, 
-      y_train, 
-      eval_set=[(X_val_prepared, y_val)],
-      eval_metric='auc',
-      callbacks=[
-        pruning_callback, 
-        early_stopping_callback, 
-        log_callback
-      ]
-    )
+    tscv = TimeSeriesSplit(n_splits=cv_splits)
+    f1_scores = []
 
-    y_pred = classifier.predict(X_val_prepared)
-    macro_f1 = f1_score(y_val, y_pred, average='macro')
+    # Implements Rolling Window Cross-Validation (no critical periods are excluded).
+    for fold_idx, (train_idx, val_idx) in enumerate(tscv.split(X_full)):
+      X_fold_train, y_fold_train = X_full.iloc[train_idx], y_full.iloc[train_idx]
+      X_fold_val, y_fold_val = X_full.iloc[val_idx], y_full.iloc[val_idx]
 
-    return macro_f1
+      preprocessor = model_template.named_steps['preprocessor']
+      classifier = model_template.named_steps['classifier']
+
+      X_fold_train_prepared = preprocessor.fit_transform(X_fold_train, y_fold_train)
+      X_fold_val_prepared = preprocessor.transform(X_fold_val)
+
+      early_stopping_callback = early_stopping(
+        stopping_rounds=100,
+        first_metric_only=True
+      )
+
+      log_callback = log_evaluation(period=0)
+
+      classifier.fit(
+        X_fold_train_prepared,
+        y_fold_train,
+        eval_set=[(X_fold_val_prepared, y_fold_val)],
+        eval_metric='auc',
+        callbacks=[
+          early_stopping_callback,
+          log_callback
+        ]
+      )
+
+      y_pred_val = classifier.predict(X_fold_val_prepared)
+      # Uses binary F1-score to avoid class imbalance issues.
+      fold_f1 = f1_score(y_fold_val, y_pred_val, average='binary')
+      f1_scores.append(fold_f1)
+
+      del (
+        X_fold_train, 
+        y_fold_train, 
+        X_fold_val, 
+        y_fold_val, 
+        X_fold_train_prepared, 
+        X_fold_val_prepared
+      )
+      gc.collect()
+
+    return np.mean(f1_scores)
 
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
 
-  X_train_path = ti.xcom_pull(key='X_train_path')
-  y_train_path = ti.xcom_pull(key='y_train_path')
+  X_full_path = ti.xcom_pull(key='X_full_path')
+  y_full_path = ti.xcom_pull(key='y_full_path')
 
-  X_train = pd.read_parquet(X_train_path, engine='pyarrow')
-  y_train = pd.read_parquet(y_train_path, engine='pyarrow').iloc[:, 0]
+  X_full = pd.read_parquet(X_full_path, engine='pyarrow')
+  y_full = pd.read_parquet(y_full_path, engine='pyarrow').iloc[:, 0]
 
-  X_val_path = ti.xcom_pull(key='X_val_path')
-  y_val_path = ti.xcom_pull(key='y_val_path')
-
-  X_val = pd.read_parquet(X_val_path, engine='pyarrow')
-  y_val = pd.read_parquet(y_val_path, engine='pyarrow').iloc[:, 0]
-
-  model_path = ti.xcom_pull(key='model_path')
-  model = joblib.load(model_path)
+  model_template_path = ti.xcom_pull(key='model_template_path')
+  model_template = joblib.load(model_template_path)
 
   sampler = TPESampler(seed=RANDOM_STATE)
-  pruner = optuna.pruners.MedianPruner(
-    n_startup_trials=10, 
-    # Has to be at least the same value as the internal early stopping rounds.
-    n_warmup_steps=100,
-    interval_steps=10
-  )
-
-  study = optuna.create_study(
-    direction="maximize", 
-    sampler=sampler, 
-    pruner=pruner
-  )
+  study = optuna.create_study(direction="maximize", sampler=sampler)
 
   study.optimize(
     lambda trial: objective_function(
       trial, 
-      X_train, 
-      y_train, 
-      X_val, 
-      y_val, 
-      model
+      X_full, 
+      y_full, 
+      model_template
     ),
-    n_trials=35
+    n_trials=50
   )
 
   print("Best hyperparameters:")
@@ -217,6 +212,7 @@ def generate_optuna_plots(**kwargs):
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
+
   study_path = ti.xcom_pull(key='study_path')
   study = joblib.load(study_path)
   
@@ -248,49 +244,23 @@ def generate_optuna_plots(**kwargs):
 
 def setup_optimized_model(**kwargs):
   """
-  Sets up the optimized model with the best parameters.
+  Refits the model template with the best parameters.
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
 
-  numerical_features = ti.xcom_pull(key='numerical_features')
-  categorical_features = ti.xcom_pull(key='categorical_features')
+  X_full_path = ti.xcom_pull(key='X_full_path')
+  y_full_path = ti.xcom_pull(key='y_full_path')
 
-  X_train_path = ti.xcom_pull(key='X_train_path')
-  y_train_path = ti.xcom_pull(key='y_train_path')
-
-  X_train = pd.read_parquet(X_train_path, engine='pyarrow')
-  y_train = pd.read_parquet(y_train_path, engine='pyarrow').iloc[:, 0]
-
-  X_val_path = ti.xcom_pull(key='X_val_path')
-  y_val_path = ti.xcom_pull(key='y_val_path')
-
-  X_val = pd.read_parquet(X_val_path, engine='pyarrow')
-  y_val = pd.read_parquet(y_val_path, engine='pyarrow').iloc[:, 0]
-
-  # Uses all available data to fit the preprocessor (hyperparameters were already optimized).
-  X_fusion = pd.concat([X_train, X_val], ignore_index=True)
-  y_fusion = pd.concat([y_train, y_val], ignore_index=True)
-
-  preprocessed_dir = f"{base_dir}/preprocessed"
-  X_fusion_path_out = f"{preprocessed_dir}/X_fusion.parquet"
-  X_fusion.to_parquet(X_fusion_path_out, engine='pyarrow', index=False)
-  ti.xcom_push(key='X_fusion_path', value=X_fusion_path_out)
-
-  y_fusion_path_out = f"{preprocessed_dir}/y_fusion.parquet"
-  y_fusion.to_frame(name='label').to_parquet(
-    y_fusion_path_out, 
-    engine='pyarrow', 
-    index=False
-  )
-  ti.xcom_push(key='y_fusion_path', value=y_fusion_path_out)
-
-  del X_train, y_train, X_val, y_val
-  gc.collect()
+  X_full = pd.read_parquet(X_full_path, engine='pyarrow')
+  y_full = pd.read_parquet(y_full_path, engine='pyarrow').iloc[:, 0]
 
   study_path = ti.xcom_pull(key='study_path')
   study = joblib.load(study_path)
   best_params = study.best_trial.params
+
+  numerical_features = ti.xcom_pull(key='numerical_features')
+  categorical_features = ti.xcom_pull(key='categorical_features')
 
   numerical_imputer_strategy = best_params.get(
     "numerical_imputer_strategy", 
@@ -349,16 +319,11 @@ def setup_optimized_model(**kwargs):
 
   optimized_model.set_params(**best_classifier_params)
 
-  preprocessor = optimized_model.named_steps['preprocessor']
-  classifier = optimized_model.named_steps['classifier']
-
-  X_fusion_prepared = preprocessor.fit_transform(X_fusion, y_fusion)
-
-  log_callback = log_evaluation(period=100)  
-  classifier.fit(
-    X_fusion_prepared,
-    y_fusion,
-    callbacks=[log_callback]
+  log_callback = log_evaluation(period=100)
+  optimized_model.fit(
+    X_full, 
+    y_full,
+    classifier__callbacks=[log_callback]
   )
 
   models_dir = f"{base_dir}/models"
