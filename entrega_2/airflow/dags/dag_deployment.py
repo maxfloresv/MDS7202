@@ -40,7 +40,7 @@ with DAG(
     dl_transactions = BashOperator(
       task_id='dl_transactions',
       retries=3,
-      bash_command="gdown 1dkUPLVXq_patD2RAKsb7ix-kQyRigcUo -O "
+      bash_command="gdown 1fJzTC6l-kvOg2a1UDGm_xfh6T61bu0wm -O "
         "{{ ti.xcom_pull(key='base_dir') }}/raw/transacciones.parquet"
     )
 
@@ -92,7 +92,7 @@ with DAG(
     generate_test_data = PythonOperator(
       task_id='generate_test_data',
       python_callable=generate_test_data,
-      op_kwargs={'W': 3, 'Y': 2025}
+      op_kwargs={'W': 4, 'Y': 2025}
     )
 
     generate_week_predictions = PythonOperator(

@@ -30,14 +30,14 @@ def find_best_threshold_binary(y_true, y_probs):
 
 def generate_test_data(W: int, Y: int, **kwargs):
   """
-  Generates the input DataFrame for the given week (W) and year (Y) for each customer-product combination.
+  Generates test data with full advanced Feature Engineering.
 
   Parameters
   ----------
   W : int
-    The week to generate the test data for.
+    The week to generate test data for.
   Y : int
-    The year to generate the test data for.
+    The year to generate test data for.
   """
   ti = kwargs['ti']
   base_dir = ti.xcom_pull(key='base_dir')
@@ -49,7 +49,8 @@ def generate_test_data(W: int, Y: int, **kwargs):
   last_known_week = df[df['year'] == last_known_year]['week'].max()
 
   mask = (df['year'] == last_known_year) & (df['week'] == last_known_week)
-  candidates = df[mask][[
+  
+  static_cols = [
     'customer_id', 
     'product_id', 
     'X', 
@@ -62,65 +63,148 @@ def generate_test_data(W: int, Y: int, **kwargs):
     'segment', 
     'package', 
     'brand'
-  ]].copy()
+  ]
+  candidates = df[mask][static_cols].copy()
 
   candidates = candidates.drop_duplicates(
-    subset=['customer_id', 'product_id'],
+    subset=['customer_id', 'product_id'], 
     keep='last'
   )
 
   candidates['week'] = W
   candidates['year'] = Y
-
-  # Dummy values to concatenate with the existing dataframe.
   candidates['items'] = np.nan
   candidates['label'] = np.nan
 
   df_window = pd.concat([df, candidates], ignore_index=True)
-  # Recuperates the last occurrence to be consistent with lags and rolling features.
-  df_window = df_window.sort_values(
-    by=['customer_id', 'product_id', 'year', 'week']
+  df_window = df_window.sort_values(by=[
+    'customer_id', 'product_id', 'year', 'week'
+  ])
+
+  df_window['week_abs'] = df_window['year'].astype(int) * 52 + df_window['week'].astype(int)
+
+  # Recency (R)
+  df_window['week_of_purchase'] = np.where(df_window['items'] > 0, df_window['week_abs'], np.nan)
+  df_window['last_purchase_week_abs'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['week_of_purchase'].ffill()
+  df_window['last_purchase_week_abs_shifted'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['last_purchase_week_abs'].shift(1)
+  df_window['weeks_since_last_purchase'] = (
+    df_window['week_abs'] - df_window['last_purchase_week_abs_shifted']
+  )
+  df_window['weeks_since_last_purchase'] = df_window['weeks_since_last_purchase'].fillna(1000).astype(int)
+  
+  df_window.drop(columns=[
+    'week_of_purchase',
+    'last_purchase_week_abs',
+    'last_purchase_week_abs_shifted'
+  ], inplace=True)
+
+  # Frequency (F) & Monetary (M)
+  df_window['accumulated_purchase_count'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['label'].transform(
+    lambda x: x.shift(1).expanding().sum()
+  ).fillna(0)
+  df_window['accumulated_items_volume'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['items'].transform(
+      lambda x: x.shift(1).expanding().sum()
+  ).fillna(0)
+
+  # Periodicity (P)
+  purchases_only = df_window[df_window['items'] > 0].copy()
+  purchases_only = purchases_only.sort_values(by=[
+    'customer_id', 'product_id', 'week_abs'
+  ])
+  
+  purchases_only['prev_purchase_week'] = purchases_only.groupby(
+    ['customer_id', 'product_id']
+  )['week_abs'].shift(1)
+  purchases_only['inter_purchase_gap'] = (
+    purchases_only['week_abs'] - purchases_only['prev_purchase_week']
+  )
+  
+  purchases_only['gap_mean'] = purchases_only.groupby(
+    ['customer_id', 'product_id']
+  )['inter_purchase_gap'].transform(lambda x: x.expanding().mean())
+  purchases_only['gap_std'] = purchases_only.groupby(
+    ['customer_id', 'product_id']
+  )['inter_purchase_gap'].transform(lambda x: x.expanding().std())
+
+  periodicity_cols = [
+    'customer_id', 
+    'product_id', 
+    'week_abs', 
+    'gap_mean', 
+    'gap_std'
+  ]
+  df_window = df_window.merge(
+    purchases_only[periodicity_cols], 
+    on=['customer_id', 'product_id', 'week_abs'], 
+    how='left', 
+    suffixes=('', '_new')
   )
 
-  df_window['items_lag_1'] = df_window.groupby(
+  df_window['periodicity_mean'] = df_window.groupby(
     ['customer_id', 'product_id']
-  )['items'].shift(1)
+  )['gap_mean'].transform(lambda x: x.ffill().shift(1)).fillna(-1)
+  df_window['periodicity_std'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['gap_std'].transform(
+    lambda x: x.ffill().shift(1)
+  ).fillna(-1)
 
+  df_window['items_lag_1'] = df_window.groupby(['customer_id', 'product_id'])['items'].shift(1)  
   df_window['items_rolling_mean_4w'] = df_window.groupby(
     ['customer_id', 'product_id']
   )['items'].transform(
-    lambda x: x.shift(1).rolling(
-      window=4,
-      min_periods=1
-    ).mean()
+    lambda x: x.shift(1).rolling(window=4, min_periods=1).mean()
+  )
+  df_window['items_rolling_mean_12w'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['items'].transform(
+    lambda x: x.shift(1).rolling(window=12, min_periods=1).mean()
+  )
+  df_window['items_expanding_mean'] = df_window.groupby(
+    ['customer_id', 'product_id']
+  )['items'].transform(
+    lambda x: x.shift(1).expanding().mean()
   )
   df_window['purchased_lag_1'] = df_window.groupby(
     ['customer_id', 'product_id']
   )['label'].shift(1)
 
-  features_to_fill = ['items_lag_1', 'items_rolling_mean_4w', 'purchased_lag_1']
-  df_window[features_to_fill] = df_window[features_to_fill].fillna(0)
+  fill_cols = [
+    'items_lag_1', 
+    'items_rolling_mean_4w', 
+    'items_rolling_mean_12w', 
+    'items_expanding_mean', 
+    'purchased_lag_1'
+  ]
 
-  X_test = df_window[
-    (df_window['year'] == Y) & (df_window['week'] == W)
-  ].copy()
+  df_window.drop(columns=[
+    'week_abs',
+    'gap_mean',
+    'gap_std'
+  ], inplace=True)
+  df_window[fill_cols] = df_window[fill_cols].fillna(0)
 
-  week_sin = np.sin(2 * np.pi * W / 52)
-  week_cos = np.cos(2 * np.pi * W / 52)
-  X_test['week_sin'] = week_sin
-  X_test['week_cos'] = week_cos
-  
+  X_test = df_window[(df_window['year'] == Y) & (df_window['week'] == W)].copy()
+
+  X_test['week_sin'] = np.sin(2 * np.pi * W / 52)
+  X_test['week_cos'] = np.cos(2 * np.pi * W / 52)
+
   X_full_path = ti.xcom_pull(key='X_full_path')
   X_full_schema = pd.read_parquet(X_full_path, engine='pyarrow')[:0]
   objective_columns = X_full_schema.columns.tolist()
-
   X_test = X_test[objective_columns]
-  print(X_test.head())
-
+  
   splits_dir = f"{base_dir}/splits"
   X_test_path_out = f"{splits_dir}/X_test_week_{W}_year_{Y}.parquet"
   X_test.to_parquet(X_test_path_out, engine='pyarrow', index=False)
-
   ti.xcom_push(key='X_test_path', value=X_test_path_out)
 
 def generate_week_predictions(**kwargs):

@@ -37,7 +37,14 @@ def prepare_full_data(**kwargs) -> None:
         'week_cos',
         'items_lag_1',
         'items_rolling_mean_4w',
-        'purchased_lag_1'
+        'purchased_lag_1',
+        'weeks_since_last_purchase',
+        'items_rolling_mean_12w',
+        'items_expanding_mean',
+        'accumulated_purchase_count',
+        'accumulated_items_volume',
+        'periodicity_mean',
+        'periodicity_std'
     ]
     categorical = [
         'customer_type', 
@@ -51,6 +58,7 @@ def prepare_full_data(**kwargs) -> None:
     ti.xcom_push(key='numerical_features', value=numerical)
     ti.xcom_push(key='categorical_features', value=categorical)
     
+    # Prevents Data Leakage.
     drop_cols = ['label', 'week', 'items']
     X_full = df.drop(columns=drop_cols)
     y_full = df['label']
