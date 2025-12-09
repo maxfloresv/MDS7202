@@ -15,6 +15,7 @@ RUN pip install --no-cache-dir \
     feature-engine \
     pyarrow \
     optuna \
+    optuna-integration \
     lightgbm \
     scipy \
     shap \

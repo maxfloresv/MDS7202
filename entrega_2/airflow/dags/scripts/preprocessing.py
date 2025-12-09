@@ -29,7 +29,8 @@ def create_folders(**kwargs) -> None:
         'models', 
         'transformers', 
         'studies',
-        'images'
+        'images',
+        'predictions'
     ]:
         os.makedirs(f"{base_dir}/{dir}", exist_ok=True)
     ti.xcom_push(key='base_dir', value=base_dir)
@@ -244,38 +245,172 @@ def generate_base_dataframe(**kwargs) -> None:
     except FileNotFoundError as err:
         raise FileNotFoundError(f"Error reading preprocessed data files: {err}")
 
+    trx['year'] = trx['purchase_date'].dt.isocalendar().year
     trx['week'] = trx['purchase_date'].dt.isocalendar().week
 
-    customer_ids = customers['customer_id'].unique()
-    product_ids = products['product_id'].unique()
-    weeks = trx['week'].unique()
+    existing_pairs = trx[['customer_id', 'product_id']].drop_duplicates()
+    unique_periods = trx[['year', 'week']].drop_duplicates()
 
-    base = pd.MultiIndex.from_product(
-        [customer_ids, product_ids, weeks],
-        names=['customer_id', 'product_id', 'week']
-    ).to_frame(index=False)
-    
-    del customer_ids, product_ids, weeks
+    base = existing_pairs.merge(
+        unique_periods, 
+        how='cross'
+    )
+
+    del existing_pairs, unique_periods
     gc.collect()
 
-    weekly_trx = (
-        trx.groupby(['customer_id', 'product_id', 'week'])
+    period_trx = (
+        trx.groupby(['customer_id', 'product_id', 'year', 'week'])
             .agg({'items': 'sum'})
             .reset_index()
     )
 
     df = base.merge(
-        weekly_trx,
-        on=['customer_id', 'product_id', 'week'],
+        period_trx,
+        on=['customer_id', 'product_id', 'year', 'week'],
         how='left'
     )
 
-    del base, weekly_trx
+    del base, period_trx
     gc.collect()
 
     df['items'] = df['items'].fillna(0)
     df['label'] = (df['items'] > 0).astype(int)
-    df.drop(columns=['items'], inplace=True)
+
+    df = df.sort_values(
+        by=['customer_id', 'product_id', 'year', 'week']
+    )
+
+    df['week_abs'] = df['year'].astype(int) * 52 + df['week'].astype(int)
+
+    # Recency (R)
+    df['week_of_purchase'] = np.where(df['items'] > 0, df['week_abs'], np.nan)
+    # Fills with the last purchase week for each customer and product.
+    df['last_purchase_week_abs'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['week_of_purchase'].ffill()
+    # Shifts the last purchase week by 1 week to calculate the weeks since last purchase 
+    # (excluding the current week). This is necessary to prevent Data Leakage.
+    df['last_purchase_week_abs_shifted'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['last_purchase_week_abs'].shift(1)
+    df['weeks_since_last_purchase'] = df['week_abs'] - df['last_purchase_week_abs_shifted']
+    # Cold start period of 1000 weeks.
+    df['weeks_since_last_purchase'] = df['weeks_since_last_purchase'].fillna(1000)
+
+    df.drop(
+        columns=[
+            'week_of_purchase',
+            'last_purchase_week_abs',
+            'last_purchase_week_abs_shifted'
+        ],
+        inplace=True
+    ) 
+
+    # Frequency (F)
+    df['accumulated_purchase_count'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['label'].transform(
+        lambda x: x.shift(1).expanding().sum()
+    ).fillna(0)
+
+    # Monetary (M)
+    df['accumulated_items_volume'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['items'].transform(
+        lambda x: x.shift(1).expanding().sum()
+    ).fillna(0)
+
+    # Periodicity (P)
+    purchases_only = df[df['items'] > 0].copy()
+    purchases_only = purchases_only.sort_values(
+        by=['customer_id', 'product_id', 'week_abs']
+    )
+
+    purchases_only['prev_purchase_week'] = purchases_only.groupby(
+        ['customer_id', 'product_id']
+    )['week_abs'].shift(1)
+    purchases_only['inter_purchase_gap'] = (
+        purchases_only['week_abs'] - purchases_only['prev_purchase_week']
+    )
+
+    purchases_only['gap_mean'] = purchases_only.groupby(
+        ['customer_id', 'product_id']
+    )['inter_purchase_gap'].transform(
+        lambda x: x.expanding().mean()
+    )
+    purchases_only['gap_std'] = purchases_only.groupby(
+        ['customer_id', 'product_id']
+    )['inter_purchase_gap'].transform(
+        lambda x: x.expanding().std()
+    )
+
+    periodicity_features = purchases_only[
+        ['customer_id', 'product_id', 'week_abs', 'gap_mean', 'gap_std']
+    ]
+
+    df = df.merge(
+        periodicity_features,
+        on=['customer_id', 'product_id', 'week_abs'],
+        how='left',
+        suffixes=('', '_new')
+    )
+
+    df['periodicity_mean'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['gap_mean'].transform(
+        lambda x: x.ffill().shift(1)
+    )
+    df['periodicity_std'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['gap_std'].transform(
+        lambda x: x.ffill().shift(1)
+    )
+
+    df['periodicity_mean'] = df['periodicity_mean'].fillna(-1)
+    df['periodicity_std'] = df['periodicity_std'].fillna(-1)
+
+    del purchases_only, periodicity_features
+    gc.collect()
+
+    # Lag features
+    df['items_lag_1'] = df.groupby(['customer_id', 'product_id'])['items'].shift(1)
+    df['items_rolling_mean_4w'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['items'].transform(
+        lambda x: x.shift(1).rolling(
+            window=4, 
+            min_periods=1
+        ).mean()
+    )
+    df['items_rolling_mean_12w'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['items'].transform(
+        lambda x: x.shift(1).rolling(
+            window=12,
+            min_periods=1
+        ).mean()
+    )
+    df['purchased_lag_1'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['label'].shift(1)
+
+    df['items_expanding_mean'] = df.groupby(
+        ['customer_id', 'product_id']
+    )['items'].transform(
+        lambda x: x.shift(1).expanding().mean()
+    )
+
+    df.drop(columns=[
+        'week_abs',
+        'gap_mean',
+        'gap_std'
+    ], inplace=True)
+    df.fillna(0, inplace=True)
+
+    # Uses sine and cosine to encode the week as a periodical variable.
+    df['week_sin'] = np.sin(2 * np.pi * df['week'] / 52)
+    df['week_cos'] = np.cos(2 * np.pi * df['week'] / 52)
 
     df = df.merge(customers, on='customer_id', how='left')
     del customers
@@ -314,7 +449,22 @@ def clean_base_dataframe_types(tol: float = 0.1, **kwargs) -> None:
         'Y': 'float32',
         'X': 'float32',
         'num_deliver_per_week': 'int8',
-        'size': 'float16'
+        'size': 'float16',
+        'year': 'int16',  
+        'week': 'int8',
+        'week_sin': 'float32',
+        'week_cos': 'float32',
+        'items': 'float32',
+        'items_lag_1': 'float32',
+        'items_rolling_mean_4w': 'float32',
+        'purchased_lag_1': 'int8',
+        'weeks_since_last_purchase': 'int16',
+        'items_rolling_mean_12w': 'float32',
+        'items_expanding_mean': 'float32',
+        'accumulated_purchase_count': 'int32',
+        'accumulated_items_volume': 'float32',
+        'periodicity_mean': 'float32',
+        'periodicity_std': 'float32',
     }
     types_to_apply = {
         col: dtype for col, dtype in target_types.items() if col in df.columns
